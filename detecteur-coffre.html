@@ -270,6 +270,24 @@
     accent-color: var(--cyan);
   }
 
+  .signal-meter {
+    height: 6px;
+    border-radius: 100px;
+    background: #0e141b;
+    border: 1px solid var(--line);
+    overflow: hidden;
+    position: relative;
+  }
+  .signal-meter-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--cyan);
+    transition: width 0.04s linear, background 0.08s linear;
+  }
+  .signal-meter-fill.hit {
+    background: var(--warn);
+  }
+
   #toggleBtn {
     flex: 1;
     background: var(--cyan);
@@ -327,6 +345,9 @@
       <label>Sensibilité</label>
       <input type="range" id="sensSlider" min="10" max="90" value="45">
     </div>
+    <div class="signal-meter">
+      <div class="signal-meter-fill" id="signalFill"></div>
+    </div>
 
     <div class="row">
       <button id="toggleBtn" disabled>Place le point cible d'abord</button>
@@ -353,6 +374,7 @@
   const offsetMinus = document.getElementById('offsetMinus');
   const offsetPlus = document.getElementById('offsetPlus');
   const sensSlider = document.getElementById('sensSlider');
+  const signalFill = document.getElementById('signalFill');
 
   let stream = null;
   let target = null; // {xRatio, yRatio} relative to video natural size
@@ -363,12 +385,10 @@
 
   // Detection state
   const SAMPLE_RADIUS = 9; // px radius sampled around target, in video pixel space
-  const HISTORY_LEN = 6;
-  let brightnessHistory = [];
+  let brightnessHistory = []; // rolling window of {t, v} samples, used to find the recent minimum (background level)
   let lastTriggerTime = 0;
   const REFRACTORY_MS = 220; // minimum time between two beeps (prevents double-fire on one pass)
   let baselineBrightness = null;
-  let baselineSamples = [];
 
   // --- Audio: bip court via WebAudio (fiable, pas de fichier à charger) ---
   let audioCtx = null;
@@ -453,10 +473,6 @@
     toggleBtn.disabled = false;
     toggleBtn.textContent = 'Démarrer la détection';
     baselineBrightness = null;
-    baselineSamples = [];
-  }
-
-  function drawMarker(clientX, clientY) {
     if (marker) marker.remove();
     marker = document.createElement('div');
     marker.className = 'target-marker';
@@ -534,28 +550,46 @@
     if (!running) return;
 
     const b = sampleBrightness();
+    const now = performance.now();
+
     if (b !== null) {
-      // Build a rolling baseline (median-ish via average of history minus current spikes)
-      if (baselineSamples.length < 24) {
-        baselineSamples.push(b);
-        baselineBrightness = baselineSamples.reduce((a,v) => a+v, 0) / baselineSamples.length;
-      } else {
-        // slow-adapt baseline so gradual lighting changes don't break detection,
-        // but spikes (the needle) don't drag it up much
-        baselineBrightness = baselineBrightness * 0.985 + b * 0.015;
+      // Rolling window of recent brightness samples (timestamp + value).
+      // We use the MINIMUM of this window as the "background" reference,
+      // since the background stays roughly stable while the needle only
+      // produces a brief bright spike. A moving average is fragile here
+      // because if the needle happens to pass during calibration, it drags
+      // the average up and breaks detection for the rest of the run.
+      brightnessHistory.push({ t: now, v: b });
+      const WINDOW_MS = 1500;
+      while (brightnessHistory.length > 1 && now - brightnessHistory[0].t > WINDOW_MS) {
+        brightnessHistory.shift();
       }
 
-      brightnessHistory.push(b);
-      if (brightnessHistory.length > HISTORY_LEN) brightnessHistory.shift();
+      let windowMin = Infinity;
+      for (const sample of brightnessHistory) {
+        if (sample.v < windowMin) windowMin = sample.v;
+      }
+      baselineBrightness = windowMin;
 
-      const sensitivity = parseInt(sensSlider.value, 10); // 10..90 -> lower = stricter threshold needed? we map to threshold delta
-      // threshold: how far above baseline counts as the white needle passing
-      // higher sensitivity slider = triggers more easily = lower required delta
+      // Need a minimum amount of history before we trust the baseline,
+      // otherwise the very first frames (which might already be near a
+      // bright passage) would set a falsely high "minimum".
+      const warmedUp = brightnessHistory.length >= 8 &&
+        (now - brightnessHistory[0].t) > 300;
+
+      const sensitivity = parseInt(sensSlider.value, 10); // 10 (strict) .. 90 (loose)
+      // Higher sensitivity slider = triggers more easily = lower required delta above baseline
       const maxDelta = 140; // empirical range of brightness delta for white needle vs mid-tone background
       const requiredDelta = maxDelta * (1 - sensitivity / 100) + 10;
 
-      const isPeak = b - baselineBrightness > requiredDelta;
-      const now = performance.now();
+      const isPeak = warmedUp && (b - baselineBrightness) > requiredDelta;
+
+      // Live signal meter: how close the current brightness is to the trigger threshold
+      if (warmedUp) {
+        const ratio = Math.max(0, Math.min(1, (b - baselineBrightness) / requiredDelta));
+        signalFill.style.width = (ratio * 100) + '%';
+        signalFill.classList.toggle('hit', isPeak);
+      }
 
       if (isPeak && (now - lastTriggerTime) > REFRACTORY_MS) {
         lastTriggerTime = now;
@@ -593,7 +627,6 @@
     toggleBtn.textContent = 'Arrêter';
     toggleBtn.classList.add('running');
     baselineBrightness = null;
-    baselineSamples = [];
     brightnessHistory = [];
     detectionTick();
   }
@@ -615,4 +648,4 @@
 })();
 </script>
 </body>
-</html>
+  </html>
